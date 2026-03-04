@@ -1,0 +1,18 @@
+
+# ============================================================
+# DadBot requirements
+# Core dependencies only — trimmed for HuggingFace deployment
+# ============================================================
+
+# Environment and API
+python-dotenv
+openai
+
+# UI
+gradio
+
+# Data handling (required by progress_module.py for gr.LinePlot)
+pandas
+
+# Authentication (required by auth_module.py for password hashing)
+bcrypt
