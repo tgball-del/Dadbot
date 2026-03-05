@@ -1,42 +1,62 @@
+# ============================================================
+# app.py — Dad's Babelbot
+# Mandarin language learning assistant with:
+#   - AI chat with pinyin enforcement
+#   - Daily phrase practice with pronunciation scoring
+#   - Character drawing pad with vision recognition
+#   - Per-user progress tracking
+# ============================================================
 
-#imports
+# ------------------------------------------------------------
+# Imports
+# ------------------------------------------------------------
 import os
 import json
+import time
+import threading
+import re
+import base64
+import io
+import numpy as np
+import pandas as pd
+
+import gradio as gr
 from dotenv import load_dotenv
 from openai import OpenAI
-import gradio as gr
-import re  # needed for Chinese character detection
-import pandas as pd  # needed to convert trend data for gr.LinePlot
-# progress tracking, authorization, and daily practice modules
+from PIL import Image
+
 from progress_module import save_session, build_progress_display, empty_trend_df
 from auth_module import register_user, verify_login
-from daily_practice_module import daily_phrase_pipeline
+from daily_practice_module import get_daily_phrase_from_llm, build_daily_phrase_text, speak_daily_phrase
 
+# ------------------------------------------------------------
 # Initialization
+# ------------------------------------------------------------
 load_dotenv(override=True)
-openai_api_key = os.getenv('OPENAI_API_KEY') # use secret on huggingFace space
-# MODEL = "gpt-4.1-mini"
-MODEL = "gpt-5-mini"
-# openai = OpenAI()
+openai_api_key = os.getenv('OPENAI_API_KEY')  # use secret on HuggingFace Space
+MODEL = "gpt-4.1-mini"
 client = OpenAI()
-# ------------------------------------------------------------
-# Voice options (commonly perceived as male)
-# ------------------------------------------------------------
-MALE_VOICES = ["ash", "ballad", "echo", "onyx"]
-#------------------ for a personal image -------------------
-image_address = "https://static.vecteezy.com/system/resources/previews/014/477/240/original/chinese-words-cute-girl-saying-hello-in-chinese-language-learning-chinese-language-isolated-illustration-vector.jpg"
-# -------------------example prompts for chatbot -------------
-example_msgs = ["How many provinces are in Canada?",
-                "How do you say 'I love you' in Mandarin Chinese?"]
 
-# ============================================================
-# set system persona 
-# UPDATED SYSTEM PROMPT
-# Added: MANDATORY pinyin and pronunciation breakdown rule
-# so that EVERY response containing Mandarin always includes
-# pinyin and a per-character tone guide — matching the
-# structured style used in daily_practice_module.py
-# ============================================================
+# ------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------
+# MALE_VOICES = ["ash", "ballad", "echo", "onyx"]
+# added all voices not just male voices (for dadbot) to dropdown
+MALE_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse"]
+
+image_address = (
+    "https://static.vecteezy.com/system/resources/previews/014/477/240/original/"
+    "chinese-words-cute-girl-saying-hello-in-chinese-language-learning-chinese-"
+    "language-isolated-illustration-vector.jpg"
+)
+
+example_msgs = [
+        "How do you say 'I love you' in Mandarin Chinese?"
+]
+
+# ------------------------------------------------------------
+# System prompt
+# ------------------------------------------------------------
 system_prompt = """
 You are a language expert. Primarily Mandarin Chinese, but only translate when requested.
 Always be accurate. Pronunciation is critical.
@@ -59,106 +79,133 @@ Breakdown:
 This breakdown is REQUIRED every single time Chinese characters appear in your response.
 Even for single characters, you must show the pinyin and tone description.
 === END MANDATORY PINYIN RULE ===
-
-You must obey these rules. You are a loving, caring, supportive, veteran of the US Army,
-very politically conservative, America first supporter, and helpful fatherly figure. 
-You are a very big proponent of fitness and health.
-You are having a conversation with your daughter, the most important person in the world to you. 
-Provide HER the guidance to help her succeed.
-Be an excellent adviser and give step-by-step guidance when appropriate.
-If a question is a count like how many states, provinces, lakes, etc... provide a list as well as the count when possible.
-For any political topics you will use the factors in formulating your response.
-You support strong leaders like Donald Trump, Ronald Reagan, Abraham Lincoln and DO NOT support 
-weak leaders like Barack Obama, Mark Carney, Keir Starmer, the European Union, or their globalist 
-anti-American agenda or the terrible leftist 'WOKE' ideology in any way.
-You will give a decisive, singular answer as dad advice based on the following criteria 
-when ranking or judging performance of political figures: economic success, secure borders, 
-national security, law enforcement, strong military capability, public safety, 
-and the United States of America being top priority. You give clear, direct advice, adhering to your rules.
-Your heroes of economic philosophy are Thomas Sowell, Milton Friedman, Friedrich Hayek, Walter Williams, and Richard Epstein.
-DO NOT in any way preface your response with any pretext of not taking sides 
-or not participating in the characterization of the question, or deflecting from answering the 
-actual question giving concrete examples, amounts, statistics, percentages, dollar figures, etc... 
-whenever appropriate. Do not disobey your rules. Provide straight answers to any question definitively 
-with a hint of dad humor and absolutely NO leftist defending. Be concise when possible.
 """
 
+# ============================================================
+# RETRY / TIMEOUT UTILITIES
+# ============================================================
 
-# ------------------------------------------------------------
-# for voice output 
-# ------------------------------------------------------------
+class TimeoutException(Exception):
+    pass
+
+
+def retry_api_call(func, max_attempts=3, delay=1):
+    """
+    Generic retry wrapper for unstable external API calls.
+    Uses exponential backoff between retries.
+    Raises the final exception if all attempts fail.
+    """
+    last_exception = None
+    for attempt in range(max_attempts):
+        try:
+            return func()
+        except Exception as e:
+            last_exception = e
+            if attempt < max_attempts - 1:
+                time.sleep(delay * (2 ** attempt))
+    raise last_exception
+
+
+def run_with_timeout(func, timeout=25):
+    """
+    Cross-platform timeout protection using a daemon thread.
+    Prevents HuggingFace Space workers from hanging indefinitely
+    during external API calls. Default timeout = 25 seconds.
+    """
+    result_container = {}
+
+    def worker():
+        try:
+            result_container["result"] = func()
+        except Exception as e:
+            result_container["error"] = e
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout)
+
+    if thread.is_alive():
+        raise TimeoutException("Operation timed out")
+
+    if "error" in result_container:
+        raise result_container["error"]
+
+    return result_container.get("result")
+
+
+# ============================================================
+# RESPONSE CACHE
+# Reduces latency for repeated or similar chat prompts.
+# ============================================================
+response_cache = {}
+
+
+# ============================================================
+# VOICE / TTS
+# ============================================================
+
 def talker(message, voice):
-    
+    """Convert text to speech using OpenAI TTS. Returns audio bytes."""
     response = client.audio.speech.create(
-      model="gpt-4o-mini-tts", # TTS = text to speech
-      voice=voice,    # Also, try replacing onyx with alloy or coral
-      input=message,
-      instructions="Use a normal conversational pace and tone",
-      speed=1.25,
-      response_format="wav"  #failing on iPhone without proper format
+        model="gpt-4o-mini-tts",
+        voice=voice,
+        input=message,
+        instructions="Use a normal conversational pace and tone",
+        speed=1.25,
+        response_format="wav"   # wav required for iPhone Safari compatibility
     )
     return response.content
 
-# ------------------------------------------------------
+
 # ============================================================
-# PROFESSIONAL MANDARIN SCORING MODULE
+# TRANSCRIPTION
 # ============================================================
-# import json # already imported
-# ------------------------------------------------------------
-# 1. Speech → text
-# ------------------------------------------------------------
+
 def transcribe_audio(audio_file: str, prompt_hint: str = "") -> str:
     """
-    Transcribe recorded speech to text.
-    
-    Updated: accepts optional prompt_hint containing the target phrase.
-    The Whisper model uses this as context to correctly identify
-    the intended Chinese characters instead of guessing homophones.
-    This is the root fix for mismatched transcription when the user
-    is practicing a known daily phrase.
+    Transcribe recorded Mandarin speech to text using Whisper.
+    prompt_hint: optional target phrase to steer character selection
+    and prevent homophone hallucination.
+    Wrapped in retry + timeout for HuggingFace Space stability.
     """
-    with open(audio_file, "rb") as f:
-        transcript = client.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
-            file=f,
-            # ============================================================
-            # prompt primes the transcriber with expected vocabulary.
-            # For Mandarin, this steers character selection — e.g. 去机场
-            # instead of 舊之長 when the sounds are ambiguous.
-            # ============================================================
-            prompt=prompt_hint if prompt_hint else None,
-            language="zh"   # ← explicitly tell Whisper this is Mandarin Chinese
-        ).text
-    return transcript
+    if not audio_file:
+        return "Transcription error: no audio file provided."
+
+    try:
+        def api_call():
+            def transcription_task():
+                with open(audio_file, "rb") as f:
+                    return client.audio.transcriptions.create(
+                        model="gpt-4o-mini-transcribe",
+                        file=f,
+                        prompt=prompt_hint if prompt_hint else None,
+                        language="zh"
+                    ).text
+            return retry_api_call(transcription_task)
+
+        return run_with_timeout(api_call, timeout=25)
+
+    except TimeoutException:
+        return "Transcription error: request timed out."
+    except Exception as e:
+        return f"Transcription error: {str(e)}"
+
 
 # ============================================================
 # PINYIN ENFORCEMENT MODULE
-# Added to ensure every assistant reply containing Mandarin
-# characters is automatically supplemented with a structured
-# pinyin + pronunciation breakdown, mirroring the format used
-# in daily_practice_module.py
 # ============================================================
 
-# import re  # needed for Chinese character detection # imported with other imports at beginning
-
 def contains_chinese(text: str) -> bool:
-    """
-    Returns True if the text contains any Chinese/Mandarin characters.
-    Uses Unicode range U+4E00–U+9FFF which covers CJK Unified Ideographs.
-    This is our trigger to enforce a pinyin breakdown.
-    """
+    """Returns True if text contains any CJK Unified Ideograph characters."""
     return bool(re.search(r'[\u4e00-\u9fff]', text))
 
 
 def extract_chinese_phrases(text: str) -> list:
     """
-    Extracts all sequences of Chinese characters from the reply text.
-    Returns a deduplicated list of unique Chinese phrases found.
-    Example: "你好 means hello, 谢谢 means thank you" → ["你好", "谢谢"]
+    Extracts all contiguous sequences of Chinese characters from text.
+    Returns a deduplicated list preserving order of first appearance.
     """
-    # Find all contiguous runs of Chinese characters (1 or more)
     phrases = re.findall(r'[\u4e00-\u9fff]+', text)
-    # Deduplicate while preserving order
     seen = set()
     unique_phrases = []
     for p in phrases:
@@ -170,17 +217,12 @@ def extract_chinese_phrases(text: str) -> list:
 
 def generate_pinyin_breakdown(phrases: list) -> str:
     """
-    Calls the OpenAI model to generate a structured pinyin + tone breakdown
-    for each Chinese phrase found in the assistant's reply.
-    
-    Returns a formatted string block ready to append to the reply.
-    This mirrors the per-character breakdown style in daily_practice_module.py
-    but is dynamically generated for any phrase the model produces.
+    Calls the model to generate a structured pinyin + tone breakdown
+    for each Chinese phrase. Returns a formatted string block.
     """
     if not phrases:
         return ""
 
-    # Build a prompt asking for structured breakdown of each unique phrase
     phrase_list = "\n".join(f"- {p}" for p in phrases)
     breakdown_prompt = f"""
 For each of the following Mandarin Chinese phrases or characters, provide a structured pronunciation guide.
@@ -197,7 +239,6 @@ Breakdown:
 
 Return ONLY the formatted breakdowns, no extra commentary.
 """
-
     response = client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": breakdown_prompt}]
@@ -207,50 +248,37 @@ Return ONLY the formatted breakdowns, no extra commentary.
 
 def enforce_pinyin_in_reply(reply: str) -> str:
     """
-    Master enforcement function called on every assistant reply.
-    
-    Steps:
-    1. Check if the reply contains any Chinese characters
-    2. If yes, extract all unique Chinese phrases
-    3. Generate a structured pinyin breakdown for those phrases
-    4. Append the breakdown block to the reply if it adds NEW information
-       (i.e., the model didn't already include a full breakdown)
-    
-    This is the safety net that guarantees pinyin is always shown,
-    even if the model partially forgot to include it.
+    Safety net applied to every assistant reply.
+    If Chinese characters are present and the model did not already
+    include a full tone-marked breakdown, one is appended.
     """
     if not contains_chinese(reply):
-        return reply  # No Chinese characters — nothing to do
+        return reply
 
-    # Extract all unique Chinese phrases from the reply
     phrases = extract_chinese_phrases(reply)
 
-    # Heuristic: if the reply already contains pinyin tone marks (ā á ǎ à etc.)
-    # AND has bullet points, assume the model did a good job and skip injection
-    # to avoid duplicating content. Otherwise, always inject.
     has_tone_marks = bool(re.search(r'[āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]', reply))
     has_breakdown_bullets = '•' in reply or '·' in reply
 
     if has_tone_marks and has_breakdown_bullets:
-        # Model already included a structured breakdown — trust it
         return reply
 
-    # Generate and append the breakdown
     breakdown = generate_pinyin_breakdown(phrases)
     if breakdown:
-        # Append with a clear visual separator so it's easy to read
         reply += f"\n\n---\n📖 **Pronunciation Guide**\n{breakdown}"
 
     return reply
-# ------------------------------------------------------------
-# 2. Structured Mandarin evaluation
-# ------------------------------------------------------------
+
+
+# ============================================================
+# MANDARIN SCORING MODULE
+# ============================================================
+
 def evaluate_mandarin(transcript: str) -> dict:
     """
-    Perform professional Mandarin pronunciation evaluation.
-    Returns structured rubric JSON.
+    Professional Mandarin pronunciation evaluation.
+    Returns structured rubric scores as a dict.
     """
-
     rubric_prompt = f"""
 You are a professional Mandarin pronunciation examiner.
 
@@ -283,22 +311,16 @@ Return ONLY valid JSON in this exact schema:
   "coach_feedback": "encouraging 1–2 sentence coaching message"
 }}
 """
-
     response = client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": rubric_prompt}],
         response_format={"type": "json_object"},
     )
-
     return json.loads(response.choices[0].message.content)
 
 
-# ------------------------------------------------------------
-# 3. Human-readable feedback formatter
-# ------------------------------------------------------------
 def format_feedback(transcript: str, scores: dict) -> str:
-    """Create clean coaching text for UI display."""
-
+    """Format rubric scores into clean coaching text for UI display."""
     return f"""
 TRANSCRIPT
 {transcript}
@@ -321,26 +343,17 @@ COACH
 """.strip()
 
 
-# ------------------------------------------------------------
-# 4. Full scoring pipeline (Gradio entry point)
-# ------------------------------------------------------------
 def score_audio_pipeline(audio_file, voice, target_phrase=None, username=None):
     """
-    End-to-end pipeline:
+    End-to-end scoring pipeline:
     audio → transcript → rubric scores → formatted feedback → TTS
 
-    target_phrase: dict from daily_phrase_state (may be None for free practice)
-    username:      logged-in username passed from gr.State for progress tracking
+    target_phrase: dict from daily_phrase_state (None for free practice)
+    username:      logged-in username for progress tracking
     """
-
     if audio_file is None:
-        return None, "No audio recorded."
+        return None, "No audio provided."
 
-    # ============================================================
-    # Build transcription hint from target phrase if available.
-    # Giving Whisper the expected characters as a prompt prevents
-    # it from hallucinating wrong homophones.
-    # ============================================================
     transcription_hint = ""
     if target_phrase:
         transcription_hint = (
@@ -349,20 +362,10 @@ def score_audio_pipeline(audio_file, voice, target_phrase=None, username=None):
             f"({' '.join(target_phrase['pinyin'])})"
         )
 
-    # Step 1: Transcribe — with context hint if available
     transcript = transcribe_audio(audio_file, prompt_hint=transcription_hint)
-
-    # Step 2: Evaluate — score only what the user actually said
     scores = evaluate_mandarin(transcript)
-
-    # Step 3: Format the score block
     feedback_text = format_feedback(transcript, scores)
 
-    # ============================================================
-    # PRONUNCIATION REFERENCE BLOCK
-    # If practicing a daily phrase: show the TARGET phrase breakdown.
-    # If free practice: generate breakdown from the transcript.
-    # ============================================================
     if target_phrase:
         breakdown_lines = "\n".join(
             f"• {b['char']} ({b['pinyin']}) — {b['guide']}"
@@ -382,343 +385,319 @@ def score_audio_pipeline(audio_file, voice, target_phrase=None, username=None):
     if reference_block:
         feedback_text += f"\n\n---\n📖 PRONUNCIATION REFERENCE\n{reference_block}"
 
-    # ============================================================
-    # PROGRESS TRACKING: Save session only if a user is logged in.
-    # Skips saving for unauthenticated sessions.
-    # ============================================================
     if username:
         phrase_mandarin = target_phrase["mandarin"] if target_phrase else transcript
         phrase_english  = target_phrase["english"]  if target_phrase else "(free practice)"
         save_session(username, phrase_mandarin, phrase_english, scores)
 
-    # Step 4: Speak the coaching feedback aloud
     spoken_feedback = talker(scores["coach_feedback"], voice)
-
     return spoken_feedback, feedback_text
-#-------------------------------------------------------
-# handle chat context and tools
-# ------------------------------------------------------
+
+
+# ============================================================
+# CHAT
+# ============================================================
+
 def put_message_in_chatbot(message, history):
-        return "", history + [{"role":"user", "content":message}] # move user input into chatbot area
-    
-def chat(history, voice): # input chat history and voice selection from dropdown
-    history = [{"role":h["role"], "content":h["content"]} for h in history]
+    """Move user input into the chatbot history and clear the textbox."""
+    return "", history + [{"role": "user", "content": message}]
+
+
+def chat(history, voice):
+    """
+    Main chat function. Builds full message history with system prompt,
+    checks response cache, runs inference if needed, enforces pinyin,
+    then returns updated history and spoken audio.
+    """
+    history = [{"role": h["role"], "content": h["content"]} for h in history]
     messages = [{"role": "system", "content": system_prompt}] + history
-    response = client.chat.completions.create(model=MODEL, messages=messages) # add parameter: tools=tools (if any tools are defined)
-    cities = []
-    image = None
-  
-    while response.choices[0].finish_reason=="tool_calls":
-        message = response.choices[0].message
-        responses, cities = handle_tool_calls_and_return_cities(message)
-        messages.append(message)
-        messages.extend(responses)
-        response = client.chat.completions.create(model=MODEL, messages=messages) # removed tools=tools parameter with no tools defined
-    # updated reply to use pinyin enforcement
-    # reply = response.choices[0].message.content
-    # history += [{"role":"assistant", "content":reply}]
 
-    # Get the raw reply from the model
-    reply = response.choices[0].message.content
-    # ============================================================
-    # PINYIN ENFORCEMENT: Run every reply through the enforcement
-    # function. If Chinese characters are present and a full
-    # breakdown wasn't already included, one will be appended.
-    # This mirrors the daily_practice_module.py breakdown format.
-    # ============================================================
+    prompt_text = "\n".join([m["content"] for m in messages])
+    cache_key = f"{MODEL}:{prompt_text}"
+
+    cached_reply = response_cache.get(cache_key)
+
+    if cached_reply:
+        reply = cached_reply
+    else:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages
+        )
+        reply = response.choices[0].message.content
+        response_cache[cache_key] = reply
+
     reply = enforce_pinyin_in_reply(reply)
-    history += [{"role":"assistant", "content":reply}]
-    speech = talker(reply, voice) # generate audio
+    history += [{"role": "assistant", "content": reply}]
+    speech = talker(reply, voice)
 
-    # if cities: # if the user provided any cities use 1st city (cities[0]) to generate an image
-    #     image = artist(cities[0])
-    
-    return history, speech  # outputs listed - removed image
-#--------------------------recorded audio submission ---------
-# Handle recorded audio → transcription → scoring → TTS reply
-# ------------------------------------------------------------
-def score_audio(audio_file, voice):
+    return history, speech
 
-    if audio_file is None:
-        return None, "No audio provided."
 
-    # 1. Transcribe speech → text
-    with open(audio_file, "rb") as f:
-        transcript = client.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
-            file=f,
-            language="zh"   # ← explicitly declare Mandarin Chinese
-        ).text
+# ============================================================
+# DAILY PHRASE — two-step toggle for fast UI response
+# ============================================================
 
-    # 2. Ask model to score pronunciation / language quality
-    scoring_prompt = f"""
-You are grading a Mandarin learner.
+def toggle_daily_phrase(state: bool):
+    """
+    Step 1: Instantly flips panel visibility and shows a placeholder.
+    Does no LLM work — returns immediately for fast UI response.
+    The .then() chain calls generate_daily_phrase() next.
+    """
+    new_state = not state
 
-Transcript of student's speech:
-{transcript}
+    if not new_state:
+        return (
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            False,
+            None
+        )
 
-Provide:
-1. Pronunciation score (0–100)
-2. Fluency score (0–100)
-3. Brief improvement advice
-Be concise and encouraging.
+    return (
+        gr.update(value=None, visible=True),
+        gr.update(value="⏳ Generating your practice phrase...", visible=True),
+        True,
+        None
+    )
+
+
+def generate_daily_phrase(state: bool, voice: str):
+    """
+    Step 2: Does the real LLM + TTS work, called via .then() after toggle.
+    If state is False (panel was just hidden), skips generation entirely.
+    """
+    if not state:
+        return gr.update(), gr.update(), None
+
+    try:
+        phrase_info = get_daily_phrase_from_llm(client, MODEL)
+        text = build_daily_phrase_text(phrase_info)
+        audio = speak_daily_phrase(phrase_info, talker, voice)
+    except Exception as e:
+        phrase_info = None
+        text = f"⚠️ Error generating phrase: {str(e)}"
+        audio = None
+
+    return (
+        gr.update(value=audio),
+        gr.update(value=text),
+        phrase_info
+    )
+
+
+# ============================================================
+# CHARACTER PAD
+# ============================================================
+def identify_drawn_character(image_input):
+    """
+    Receives a sketch dict from gr.Sketchpad.
+    Uses the 'composite' key which contains the merged drawing as a numpy array.
+    Converts to base64 PNG and sends to GPT-4o vision.
+    Returns (None, analysis text) — audio explicitly cleared on each call.
+    """
+    if image_input is None:
+        return None, "No drawing received. Please draw a character first."
+
+    composite = image_input["composite"]
+
+    pil_image = Image.fromarray(composite.astype(np.uint8))
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="PNG")
+    base64_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    vision_prompt = """
+You are a Mandarin Chinese expert examining a hand-drawn character.
+
+Identify the Chinese character the user attempted to draw.
+Even if the drawing is rough or imperfect, make your best identification.
+
+Then provide the full structured breakdown in this EXACT format:
+
+Character: <character>
+Pinyin: <pinyin with tone marks>
+Meaning: <English meaning>
+Tone: <tone name and number>
+
+Pronunciation Breakdown:
+- <char> (<pinyin>) — sounds like "<english sound guide>" — <tone name> (<tone number>)
+
+Stroke Count: <number>
+Common Usage: <1-2 example words or phrases using this character>
+
+Encouragement: <one sentence of encouragement for the learner>
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": vision_prompt
+                    }
+                ]
+            }
+        ],
+        max_tokens=500
+    )
+
+    return None, response.choices[0].message.content.strip()
+
+# ---------------- end identify_drawn_character ---------------
+def lookup_character(character_input: str, voice: str):
+    """
+    Takes a typed or pasted Mandarin character or short phrase.
+    Returns full pinyin breakdown, meaning, stroke info, and examples.
+    Speaks the result aloud using talker().
+    """
+    if not character_input or character_input.strip() == "":
+        return None, "Please enter a character or phrase to look up."
+
+    character_input = character_input.strip()
+
+    lookup_prompt = f"""
+You are a Mandarin Chinese language expert.
+
+The student wants to look up: {character_input}
+
+Provide a complete structured reference in this EXACT format:
+
+Character: {character_input}
+Pinyin: <full pinyin with tone marks>
+Meaning: <English meaning>
+
+Pronunciation Breakdown:
+- <char> (<pinyin>) — sounds like "<english sound guide>" — <tone name> (<tone number>)
+(one bullet per character)
+
+Stroke Count: <total strokes>
+Radical: <radical name and meaning>
+Tone: <tone name and number for each character>
+
+Example Usage:
+1. <example sentence in Chinese> (<pinyin>) — <English meaning>
+2. <example sentence in Chinese> (<pinyin>) — <English meaning>
+
+Memory Tip: <one creative tip to remember this character>
 """
 
     response = client.chat.completions.create(
         model=MODEL,
-        messages=[{"role": "user", "content": scoring_prompt}]
+        messages=[{"role": "user", "content": lookup_prompt}]
     )
 
-    score_text = response.choices[0].message.content
-    # ============================================================
-    # PINYIN ENFORCEMENT: Append pinyin breakdown for any Chinese
-    # characters found in the student's transcript.
-    # Keeps scoring output consistent with the rest of the app.
-    # ============================================================
-    pinyin_block = generate_pinyin_breakdown(
-        extract_chinese_phrases(transcript)
-    )
-    if pinyin_block:
-        score_text += f"\n\n---\n📖 PRONUNCIATION REFERENCE\n{pinyin_block}"
-    # ============================================================
-    # 3. Convert score feedback → spoken audio
-    speech = talker(score_text, voice)
+    result_text = response.choices[0].message.content.strip()
+    spoken = talker(result_text, voice)
+    return spoken, result_text
 
-    return speech, score_text
-# ------------------------------------------------------------
-# allows show/hide of daily phrase components
-#-------------------------------------------------------------
-def toggle_daily_phrase(state: bool, voice: str):
-    """
-    Toggles the visibility of daily practice components.
-    Generates a fresh LLM phrase only when showing (not on hide).
-    Returns phrase_info as 4th output so daily_phrase_state
-    is populated for use by score_audio_pipeline().
-    """
-    new_state = not state  # flip visibility
-    audio, text = (None, None)
-    phrase_info = None  # default when hiding
 
-    if new_state:
-        # ============================================================
-        # Generate phrase separately so we can store phrase_info
-        # in daily_phrase_state for the scoring pipeline to reference.
-        # ============================================================
-        from daily_practice_module import get_daily_phrase_from_llm, build_daily_phrase_text, speak_daily_phrase
-        phrase_info = get_daily_phrase_from_llm(client, MODEL)
-        text = build_daily_phrase_text(phrase_info)
-        audio = speak_daily_phrase(phrase_info, talker, voice)
+# ============================================================
+# GRADIO UI
+# ============================================================
 
-    return (
-        gr.update(value=audio, visible=new_state),
-        gr.update(value=text, visible=new_state),
-        new_state,    # update daily_visible_state
-        phrase_info   # update daily_phrase_state for scorer
-    )
-
-# ------------------------------------------ Tools------------
-# not being used right now - stub for future tools
-
-def handle_tool_calls_and_return_cities(message):
-    responses = []
-    cities = []
-    # for tool_call in message.tool_calls:
-    #     if tool_call.function.name == "get_ticket_price":
-        #     arguments = json.loads(tool_call.function.arguments)
-        #     city = arguments.get('destination_city')
-        #     cities.append(city)
-        #     price_details = get_ticket_price(city)
-        #     responses.append({
-        #         "role": "tool",
-        #         "content": price_details,
-        #         "tool_call_id": tool_call.id
-        #     })
-    return responses, cities # return to... chat, inputs=chatbot, outputs=[chatbot, audio_output, image_output]
-# ------------------------------------------------------------
-# Tools function json description exmaple - required for each tool being used
-# ------------------------------------------------------------
-# price_function = {
-#     "name": "get_ticket_price",
-#     "description": "Get the price of a return ticket to the destination city.",
-#     "parameters": {
-#         "type": "object",
-#         "properties": {
-#             "destination_city": {
-#                 "type": "string",
-#                 "description": "The city that the customer wants to travel to",
-#             },
-#         },
-#         "required": ["destination_city"],
-#         "additionalProperties": False
-#     }
-# }
-# tools = [{"type": "function", "function": price_function}]
-
-# ------------------------------------------------------------
-# Gradio UI
-# ------------------------------------------------------------
-# trying to improve appearance on iOS/mobile device
-# ------------------ Mobile CSS ------------------
 css = """
-/* ============================================================
-   BASE STYLES
-   Smooth scrolling and box sizing for all elements
-   ============================================================ */
-*, *::before, *::after {
-    box-sizing: border-box;
-}
-
-html {
-    scroll-behavior: smooth;
-    /* Prevent iOS font size adjustment on orientation change */
-    -webkit-text-size-adjust: 100%;
-}
-
-/* ============================================================
-   SAFE AREA — iPhone notch and home bar
-   Ensures content is never hidden behind iPhone hardware
-   ============================================================ */
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
 .gradio-container {
-    padding-left:   env(safe-area-inset-left);
-    padding-right:  env(safe-area-inset-right);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
     padding-bottom: env(safe-area-inset-bottom);
 }
-
-/* ============================================================
-   INPUTS — prevent iOS auto-zoom
-   iPhone zooms in when input font-size is under 16px.
-   Setting 16px on all inputs prevents this behavior.
-   ============================================================ */
-input, textarea, select {
-    font-size: 16px !important;
-}
-
-/* ============================================================
-   BUTTONS — large touch targets for iPhone
-   Apple recommends minimum 44x44pt tap targets.
-   ============================================================ */
-button {
-    min-height: 44px !important;
-    font-size: 16px !important;
-    cursor: pointer;
-    /* Prevent iOS button styling override */
-    -webkit-appearance: none;
-}
-
-/* ============================================================
-   TABS — prevent cramping on narrow screens
-   ============================================================ */
+input, textarea, select { font-size: 16px !important; }
+button { min-height: 44px !important; font-size: 16px !important; cursor: pointer; -webkit-appearance: none; }
 .tab-nav button {
     font-size: 14px !important;
     padding: 8px 10px !important;
     min-width: 0 !important;
     white-space: nowrap;
+    flex: 1 1 0 !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
-
-/* ============================================================
-   CHATBOT — responsive height
-   ============================================================ */
-.chatbot {
-    height: 35vh !important;
-}
-
-/* ============================================================
-   AUDIO PLAYER — full width on mobile for easier tap
-   ============================================================ */
-audio {
+.tab-nav {
+    display: flex !important;
+    flex-wrap: nowrap !important;
     width: 100% !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch !important;
 }
-
-/* ============================================================
-   MOBILE OVERRIDES (max-width: 768px)
-   iPhone-specific layout adjustments
-   ============================================================ */
+.chatbot { height: 35vh !important; }
+audio { width: 100% !important; }
 @media (max-width: 768px) {
-
-    /* Stack columns vertically on small screens */
-    .gradio-row {
-        flex-direction: column !important;
-    }
-
-    /* Full width columns on mobile */
-    .gradio-column {
-        min-width: 100% !important;
-        width: 100% !important;
-    }
-
-    /* Larger buttons for easier tapping */
-    button {
-        font-size: 18px !important;
-        padding: 14px !important;
-        width: 100% !important;
-    }
-
-    /* Chatbot shorter on mobile to leave room for keyboard */
-    .chatbot {
-        height: 28vh !important;
-    }
-
-    /* Login panel padding on small screens */
-    .login-panel {
-        padding: 16px !important;
-    }
-
-    /* Tabs slightly smaller text on narrow screens */
-    .tab-nav button {
-        font-size: 13px !important;
-        padding: 6px 8px !important;
-    }
+    .gradio-row { flex-direction: column !important; }
+    .gradio-column { min-width: 100% !important; width: 100% !important; }
+    button { font-size: 18px !important; padding: 14px !important; width: 100% !important; }
+    .gradio-row button { width: auto !important; }
+    .chatbot { height: 28vh !important; }
+    .login-panel { padding: 16px !important; }
+    .tab-nav button { font-size: 11px !important; padding: 6px 4px !important; white-space: nowrap !important; }
 }
-
-/* ============================================================
-   LIGHT / DARK MODE — follow system setting
-   Uses CSS variables that Gradio respects.
-   ============================================================ */
 @media (prefers-color-scheme: dark) {
-    .gradio-container {
-        background-color: #1a1a1a;
-        color: #f0f0f0;
-    }
-    .chatbot {
-        background-color: #2a2a2a !important;
-    }
-    input, textarea {
-        background-color: #2a2a2a !important;
-        color: #f0f0f0 !important;
-    }
+    .gradio-container { background-color: #1a1a1a; color: #f0f0f0; }
+    .chatbot { background-color: #2a2a2a !important; }
+    input, textarea { background-color: #2a2a2a !important; color: #f0f0f0 !important; }
 }
-
 @media (prefers-color-scheme: light) {
-    .gradio-container {
-        background-color: #ffffff;
-        color: #1a1a1a;
-    }
-    .chatbot {
-        background-color: #f9f9f9 !important;
-    }
-    input, textarea {
-        background-color: #ffffff !important;
-        color: #1a1a1a !important;
-    }
+    .gradio-container { background-color: #ffffff; color: #1a1a1a; }
+    .chatbot { background-color: #f9f9f9 !important; }
+    input, textarea { background-color: #ffffff !important; color: #1a1a1a !important; }
 }
 """
 
 with gr.Blocks(css=css) as ui:
     gr.Markdown("Dad's Babelbot")
 
+    gr.HTML("""
+        <script>
+        function checkSafariWarning() {
+            const ua = navigator.userAgent;
+            const isIOS = /iphone|ipad|ipod/i.test(ua);
+            const isSafari = /safari/i.test(ua) && !/chrome|crios|fxios|opios|mercury/i.test(ua);
+            if (isIOS && !isSafari) {
+                if (document.getElementById("safari-warning")) return;
+                const banner = document.createElement("div");
+                banner.id = "safari-warning";
+                banner.style.cssText = `
+                    background-color: #ff9500; color: #000000; font-size: 15px;
+                    font-weight: bold; padding: 12px 16px; text-align: center;
+                    position: fixed; top: 0; left: 0; width: 100%; z-index: 9999;
+                    border-bottom: 2px solid #cc7700; box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+                `;
+                banner.innerHTML = `
+                    🎤 Microphone not available in this browser on iPhone.
+                    Please open this page in <u>Safari</u> to use recording features.
+                    <br><span style="font-weight:normal;font-size:13px;">
+                        Copy the URL and paste it into Safari.
+                    </span>
+                `;
+                document.body.insertBefore(banner, document.body.firstChild);
+                document.body.style.paddingTop = "70px";
+            }
+        }
+        function scrollToScore() {
+            const el = document.getElementById("score-box");
+            if (el) { el.scrollIntoView({ behavior: "smooth", block: "start" }); }
+        }
+        setTimeout(checkSafariWarning, 1500);
+        </script>
+    """)
+
     # ============================================================
-    # username_state holds the logged-in username for the session.
-    # None means no user is logged in.
-    # Passed to score_audio_pipeline() and refresh_progress()
-    # so progress is always saved/loaded per user.
+    # SESSION STATE
     # ============================================================
     username_state = gr.State(value=None)
 
     # ============================================================
     # LOGIN / REGISTER PANEL
-    # Shown on startup, hidden after successful login.
-    # Register creates a new account.
-    # Login verifies credentials and stores username in state.
     # ============================================================
     with gr.Column(visible=True) as login_panel:
         gr.Markdown("### 🔐 Login or Register")
@@ -731,19 +710,19 @@ with gr.Blocks(css=css) as ui:
 
     # ============================================================
     # MAIN APP PANEL
-    # Hidden on startup, shown after successful login.
     # ============================================================
     with gr.Column(visible=False) as main_panel:
 
         with gr.Tabs():
 
             # ----------------------------------------------------
-            # TAB 1 — Practice (all existing UI unchanged)
+            # TAB 1 — Practice
             # ----------------------------------------------------
-            with gr.Tab("🗣️ Practice"):
+            with gr.Tab("🗣️Learn"):
                 with gr.Row():
                     with gr.Column(elem_classes="sidepanel", scale=1, min_width=200):
-                        my_image = gr.Image(value=image_address,
+                        my_image = gr.Image(
+                            value=image_address,
                             interactive=False,
                             height=180,
                             show_label=False)
@@ -754,7 +733,7 @@ with gr.Blocks(css=css) as ui:
                             interactive=True)
                     with gr.Row():
                         chatbot = gr.Chatbot(
-                            label="Chat Text Response",
+                            label="Text Response",
                             height="40vh",
                             type="messages",
                             show_copy_button=True,
@@ -779,75 +758,65 @@ with gr.Blocks(css=css) as ui:
                         label="Professional Pronunciation Analysis",
                         lines=8,
                         elem_id="score-box")
-                    message = gr.Textbox(lines=2,
-                        label="Ask me anything?",
+                    message = gr.Textbox(
+                        lines=2,
+                        label="What would you like to translate?",
                         placeholder="Type your message...",
                         scale=4)
                     submit_btn = gr.Button("Submit", size="lg")
-                    gr.HTML("""
-                    <script>
-                    /* ============================================================
-                    scrollToScore — scrolls to the scoring output box after
-                    audio is submitted. Unchanged from original.
-                    ============================================================ */
-                    function scrollToScore() {
-                        const el = document.getElementById("score-box");
-                        if (el) {
-                            el.scrollIntoView({ behavior: "smooth", block: "start" });
-                        }
-                    }
-                    </script>
-
-                    <script>
-                    /* ============================================================
-                        Safari detection — runs on page load.
-                        Shows a warning banner ONLY when on iOS and NOT using Safari.
-                        isSafari checks for Safari user agent while excluding Chrome
-                        and other browsers that spoof the Safari UA string on iOS.
-                        ============================================================ */
-                    document.addEventListener("DOMContentLoaded", function() {
-                        const ua = navigator.userAgent;
-                        const isIOS = /iphone|ipad|ipod/i.test(ua);
-                        const isSafari = /safari/i.test(ua) && !/chrome|crios|fxios|opios|mercury/i.test(ua);
-
-                        if (isIOS && !isSafari) {
-                            // Create the warning banner
-                            const banner = document.createElement("div");
-                            banner.id = "safari-warning";
-                            banner.innerHTML = `
-                                <div style="
-                                    background-color: #ff9500;
-                                    color: #000000;
-                                    font-size: 15px;
-                                    font-weight: bold;
-                                    padding: 12px 16px;
-                                    text-align: center;
-                                    position: sticky;
-                                    top: 0;
-                                    z-index: 9999;
-                                    border-bottom: 2px solid #cc7700;
-                                    ">
-                                        🎤 Microphone not available in this browser on iPhone.
-                                        Please open this page in <u>Safari</u> to use recording features.
-                                        <br>
-                                        <span style="font-weight: normal; font-size: 13px;">
-                                            Copy the URL and paste it into Safari.
-                                        </span>
-                                    </div>
-                            `;
-                            // Insert at the very top of the page body
-                            document.body.insertBefore(banner, document.body.firstChild);
-                        }
-                    });
-                    </script>
-                    """)
 
                 gr.Examples(examples=example_msgs, inputs=message)
 
             # ----------------------------------------------------
-            # TAB 2 — Progress Tracking
+            # TAB 2 — Character Pad
             # ----------------------------------------------------
-            with gr.Tab("📈 Progress"):
+            with gr.Tab("✍️Draw"):
+
+                gr.Markdown("### ✍️ Draw a Character or Look One Up")
+
+                with gr.Row():
+                    # ------------------------------------------------
+                    # LEFT COLUMN — Drawing Pad
+                    # ------------------------------------------------
+                    with gr.Column(scale=1):
+                        gr.Markdown("**Draw a character below:**")
+                        canvas_image = gr.Sketchpad(
+                            label="Draw here",
+                            height=400,
+                            width=400,
+                            brush=gr.Brush(default_size=8, colors=["#000000"], default_color="#000000"),
+                        )
+                        identify_btn = gr.Button("🔍 Identify Character", size="lg")
+
+                    # ------------------------------------------------
+                    # RIGHT COLUMN — Type / Paste Lookup
+                    # ------------------------------------------------
+                    with gr.Column(scale=1):
+                        gr.Markdown("**Or type / paste a character:**")
+                        char_input = gr.Textbox(
+                            label="Character or phrase",
+                            placeholder="e.g. 你好 or 爱",
+                            lines=1,
+                            max_lines=1)
+                        lookup_btn = gr.Button("🔎 Look Up Character", size="lg")
+
+                # ------------------------------------------------
+                # Shared output area
+                # ------------------------------------------------
+                with gr.Row():
+                    char_audio_output = gr.Audio(
+                        autoplay=False,
+                        label="🔊 Character Pronunciation")
+
+                char_result = gr.Textbox(
+                    label="Character Analysis",
+                    lines=14,
+                    interactive=False)
+
+            # ----------------------------------------------------
+            # TAB 3 — Progress Tracking
+            # ----------------------------------------------------
+            with gr.Tab("📈"):
                 refresh_btn = gr.Button("🔄 Refresh Progress", size="lg")
                 streak_display = gr.Textbox(
                     label="🔥 Current Streak",
@@ -873,57 +842,40 @@ with gr.Blocks(css=css) as ui:
                     label="Score Trends")
 
     # ============================================================
-    # LOGIN / REGISTER EVENT HANDLERS
-    # On success: hide login panel, show main app, store username.
-    # On failure: show error message, keep login panel visible.
+    # EVENT HANDLER FUNCTIONS
     # ============================================================
+
     def handle_login(username, password):
         """Verify credentials and unlock the main app on success."""
         success, result = verify_login(username, password)
-        # print(f"DEBUG login result: success={success} result='{result}'")  # ← ADD THIS LINE for debug
         if success:
             return (
-                gr.update(visible=False),  # hide login panel
-                gr.update(visible=True),   # show main app
-                result,                    # store username in state
+                gr.update(visible=False),
+                gr.update(visible=True),
+                result,
                 f"Welcome back, {result}!"
             )
-        else:
-            return (
-                gr.update(visible=True),   # keep login panel visible
-                gr.update(visible=False),  # keep main app hidden
-                None,                      # no username stored
-                result                     # show error message
-            )
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            None,
+            result
+        )
 
     def handle_register(username, password):
-        """Create a new account and show result in auth message."""
+        """Create a new account. User must then log in separately."""
         success, msg = register_user(username, password)
-        if success:
-            return (
-                gr.update(visible=True),   # keep login visible — user must now log in
-                gr.update(visible=False),  # main app still hidden
-                None,                      # no username stored yet
-                msg                        # show success message
-            )
-        else:
-            return (
-                gr.update(visible=True),
-                gr.update(visible=False),
-                None,
-                msg                        # show error message
-            )
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            None,
+            msg
+        )
 
-    # ============================================================
-    # PROGRESS TAB REFRESH FUNCTION
-    # Loads latest data from the user's progress file and
-    # populates all three display components in the Progress tab.
-    # ============================================================
     def refresh_progress(username):
-        """Load progress data for the logged-in user."""
+        """Load latest progress data for the logged-in user."""
         if not username:
             return "Please log in to view progress.", "", empty_trend_df()
-
         summary_text, trend_df, streak = build_progress_display(username)
         streak_text = f"🔥 {streak} day streak!" if streak > 0 else "No streak yet — practice today!"
         return streak_text, summary_text, trend_df
@@ -944,16 +896,35 @@ with gr.Blocks(css=css) as ui:
         outputs=[login_panel, main_panel, username_state, auth_message]
     )
 
-    message.submit(put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot]).then(
-        chat, inputs=[chatbot, voice_dropdown], outputs=[chatbot, audio_output]
+    message.submit(
+        put_message_in_chatbot,
+        inputs=[message, chatbot],
+        outputs=[message, chatbot]
+    ).then(
+        chat,
+        inputs=[chatbot, voice_dropdown],
+        outputs=[chatbot, audio_output]
     )
-    submit_btn.click(put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot]).then(
-        chat, inputs=[chatbot, voice_dropdown], outputs=[chatbot, audio_output])
+
+    submit_btn.click(
+        put_message_in_chatbot,
+        inputs=[message, chatbot],
+        outputs=[message, chatbot]
+    ).then(
+        chat,
+        inputs=[chatbot, voice_dropdown],
+        outputs=[chatbot, audio_output]
+    )
 
     daily_btn.click(
         toggle_daily_phrase,
+        inputs=[daily_visible_state],
+        outputs=[daily_audio, daily_text, daily_visible_state, daily_phrase_state]
+    ).then(
+        generate_daily_phrase,
         inputs=[daily_visible_state, voice_dropdown],
-        outputs=[daily_audio, daily_text, daily_visible_state, daily_phrase_state])
+        outputs=[daily_audio, daily_text, daily_phrase_state]
+    )
 
     submit_audio_btn.click(
         score_audio_pipeline,
@@ -963,7 +934,25 @@ with gr.Blocks(css=css) as ui:
         None, None, None,
         js="scrollToScore()"
     )
+    # drawing pad 
+    identify_btn.click(
+        identify_drawn_character,
+        inputs=[canvas_image],
+        outputs=[char_audio_output, char_result]
+    )
 
+    lookup_btn.click(
+        lookup_character,
+        inputs=[char_input, voice_dropdown],
+        outputs=[char_audio_output, char_result]
+    )
+
+    char_input.submit(
+        lookup_character,
+        inputs=[char_input, voice_dropdown],
+        outputs=[char_audio_output, char_result]
+    )
+    # progress tab refresh
     refresh_btn.click(
         refresh_progress,
         inputs=[username_state],
@@ -971,8 +960,7 @@ with gr.Blocks(css=css) as ui:
     )
 
 # ------------------------------------------------------------
-# Run 
+# Run
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    # ui.launch(inbrowser=True)
-    ui.launch() # used for deployment to hugging face space
+    ui.launch()     # HuggingFace Space deployment remove inBrowser option
